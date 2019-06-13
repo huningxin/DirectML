@@ -3,10 +3,47 @@
 
 #include "pch.h"
 
+#include "ReadData.h"
+#include "Kits/DirectXTK12/Inc/DescriptorHeap.h"
+
 using winrt::com_ptr;
 using winrt::check_hresult;
 using winrt::check_bool;
 using winrt::handle;
+
+// Divide and round up
+static UINT DivUp(UINT a, UINT b)
+{
+    return (a + b - 1) / b;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE GetGpuHandle(
+    ID3D12Device* d3d12_device,
+    ID3D12DescriptorHeap* descriptor_heap,
+    size_t index) {
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = descriptor_heap->GetDesc();
+  uint32_t increment_size =
+      d3d12_device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+  D3D12_GPU_DESCRIPTOR_HANDLE handle;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle =
+      descriptor_heap->GetGPUDescriptorHandleForHeapStart();
+  handle.ptr = gpu_handle.ptr + UINT64(index) * UINT64(increment_size);
+  return handle;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE GetCpuHandle(
+    ID3D12Device* d3d12_device,
+    ID3D12DescriptorHeap* descriptor_heap,
+    size_t index) {
+  D3D12_DESCRIPTOR_HEAP_DESC heap_desc = descriptor_heap->GetDesc();
+  uint32_t increment_size =
+      d3d12_device->GetDescriptorHandleIncrementSize(heap_desc.Type);
+  D3D12_CPU_DESCRIPTOR_HANDLE handle;
+  D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle =
+      descriptor_heap->GetCPUDescriptorHandleForHeapStart();
+  handle.ptr = cpu_handle.ptr + UINT64(index) * UINT64(increment_size);
+  return handle;
+}
 
 void InitializeDirect3D12(
     com_ptr<ID3D12Device> & d3D12Device,
@@ -350,7 +387,192 @@ int __cdecl wmain(int /*argc*/, char ** /*argv*/)
     // once, and typically you want to Execute an operator more frequently than that.
     CloseExecuteResetWait(d3D12Device, commandQueue, commandAllocator, commandList);
 
-    // 
+   
+    // Create tensor buffers for upload/input/output/readback of the tensor elements.
+
+    // 24 elements * 4 == 96 bytes.
+    UINT64 tensorBufferSize{ dmlBufferTensorDesc.TotalTensorSizeInBytes };
+    Microsoft::WRL::ComPtr<ID3D12Resource> float16_input;
+    Microsoft::WRL::ComPtr<ID3D12Resource> float32_input;
+    com_ptr<ID3D12Resource> uploadBuffer;
+    com_ptr<ID3D12DescriptorHeap> descriptorHeap_float;
+    // Compute objects for converting texture to DML tensor format
+    Microsoft::WRL::ComPtr<ID3D12PipelineState>     m_computePSO;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature>     m_computeRootSignature;
+    {
+        enum ComputeRootParameters : uint32_t
+        {
+            e_crpIdxCB = 0,
+            e_crpIdxSRVfloat,
+            e_crpIdxSRVhalf,
+            e_crpIdxCount
+        };
+        size_t modelInputBufferSize = tensorElementCount * sizeof(float);
+        // Resource for input tensor
+
+        check_hresult(d3D12Device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+            D3D12_HEAP_FLAG_NONE,
+            &CD3DX12_RESOURCE_DESC::Buffer(modelInputBufferSize),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            __uuidof(uploadBuffer),
+            uploadBuffer.put_void()));
+        D3D12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(modelInputBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+     check_hresult(d3D12Device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&float32_input)
+        ));
+        constexpr UINT inputElementCount = tensorElementCount;
+        std::array<FLOAT, inputElementCount> inputTensorElementArray;
+        {
+            std::wcout << L"input tensor: ";
+			//1.6834542135461f;
+            float data = 2040;
+            for (auto & element : inputTensorElementArray)
+            {
+                element = data++;
+                std::wcout << element << L' ';
+            };
+            std::wcout << std::endl;
+
+            D3D12_SUBRESOURCE_DATA tensorSubresourceData{};
+            tensorSubresourceData.pData = inputTensorElementArray.data();
+            tensorSubresourceData.RowPitch = modelInputBufferSize;
+            tensorSubresourceData.SlicePitch = tensorSubresourceData.RowPitch;
+
+            // Upload the input tensor to the GPU.
+            ::UpdateSubresources(
+                commandList.get(),
+                float32_input.Get(),
+                uploadBuffer.get(),
+                0,
+                0,
+                1,
+                &tensorSubresourceData);
+            commandList->ResourceBarrier(1,
+                &CD3DX12_RESOURCE_BARRIER::Transition(
+                    float32_input.Get(),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                    ));
+        }
+
+        // Create descriptor heaps.
+        D3D12_DESCRIPTOR_HEAP_DESC descriptorHeapDesc{};
+        descriptorHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        descriptorHeapDesc.NumDescriptors = 2;
+        descriptorHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        check_hresult(d3D12Device->CreateDescriptorHeap(
+            &descriptorHeapDesc,
+            _uuidof(descriptorHeap_float),
+            descriptorHeap_float.put_void()));
+        // Describe and create a UAV for the original input tensor.
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.FirstElement = 0;
+        uavDesc.Buffer.NumElements = tensorElementCount;
+        uavDesc.Buffer.StructureByteStride = 0;
+        uavDesc.Buffer.CounterOffsetInBytes = 0;
+        uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+     d3D12Device->CreateUnorderedAccessView(float32_input.Get(), nullptr, &uavDesc,
+            GetCpuHandle(d3D12Device.get(), descriptorHeap_float.get(), 0));
+
+        
+        // Resource for input tensor
+        resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(modelInputBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+     check_hresult(d3D12Device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(&float16_input)
+        ));
+        // Describe and create a UAV for the original input tensor.
+        uavDesc.Format = DXGI_FORMAT_R16_FLOAT;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.FirstElement = 0;
+        uavDesc.Buffer.NumElements = tensorElementCount;
+        uavDesc.Buffer.StructureByteStride = 0;
+        uavDesc.Buffer.CounterOffsetInBytes = 0;
+        uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+     d3D12Device->CreateUnorderedAccessView(float16_input.Get(), nullptr, &uavDesc,
+            GetCpuHandle(d3D12Device.get(), descriptorHeap_float.get(), 1));
+
+        auto computeShaderBlob = DX::ReadData(L"nhwctonchw.cso");
+
+        // Define root table layout
+        CD3DX12_DESCRIPTOR_RANGE descRange[2];
+        descRange[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0
+        descRange[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 1); // u0
+
+        CD3DX12_ROOT_PARAMETER rootParameters[3];
+        rootParameters[e_crpIdxCB].InitAsConstants(3, 0);
+        rootParameters[e_crpIdxSRVfloat].InitAsDescriptorTable(1, &descRange[0], D3D12_SHADER_VISIBILITY_ALL);
+        rootParameters[e_crpIdxSRVhalf].InitAsDescriptorTable(1, &descRange[1], D3D12_SHADER_VISIBILITY_ALL);
+
+        CD3DX12_ROOT_SIGNATURE_DESC rootSignature(_countof(rootParameters), rootParameters);
+
+        Microsoft::WRL::ComPtr<ID3DBlob> serializedSignature;
+        check_hresult(
+            D3D12SerializeRootSignature(&rootSignature, D3D_ROOT_SIGNATURE_VERSION_1, serializedSignature.GetAddressOf(), nullptr));
+
+        // Create the root signature
+        check_hresult(
+            d3D12Device->CreateRootSignature(
+                0,
+                serializedSignature->GetBufferPointer(),
+                serializedSignature->GetBufferSize(),
+                IID_PPV_ARGS(m_computeRootSignature.ReleaseAndGetAddressOf())));
+
+        m_computeRootSignature->SetName(L"Compute RS");
+
+        // Create compute pipeline state
+        D3D12_COMPUTE_PIPELINE_STATE_DESC descComputePSO = {};
+        descComputePSO.pRootSignature = m_computeRootSignature.Get();
+        descComputePSO.CS.pShaderBytecode = computeShaderBlob.data();
+        descComputePSO.CS.BytecodeLength = computeShaderBlob.size();
+
+        check_hresult(
+            d3D12Device->CreateComputePipelineState(&descComputePSO, IID_PPV_ARGS(m_computePSO.ReleaseAndGetAddressOf())));
+        m_computePSO->SetName(L"Compute PSO");
+
+        ///================
+        {
+            ID3D12DescriptorHeap* pHeaps[] = { descriptorHeap_float.get() };
+            commandList->SetDescriptorHeaps(_countof(pHeaps), pHeaps);
+
+            commandList->SetComputeRootSignature(m_computeRootSignature.Get());
+			struct ImageLayoutCB
+			{
+				UINT Height;
+				UINT Width;
+                UINT Channel;
+			};
+            ImageLayoutCB imageLayoutCB = {};
+            imageLayoutCB.Height = 3;
+            imageLayoutCB.Width = 4;
+            imageLayoutCB.Channel = 2;
+
+            commandList->SetComputeRoot32BitConstants(e_crpIdxCB, 4, &imageLayoutCB, 0);
+            commandList->SetComputeRootDescriptorTable(e_crpIdxSRVfloat, GetGpuHandle(d3D12Device.get(), descriptorHeap_float.get(), 0));
+            commandList->SetComputeRootDescriptorTable(e_crpIdxSRVhalf, GetGpuHandle(d3D12Device.get(), descriptorHeap_float.get(), 1));
+
+            commandList->SetPipelineState(m_computePSO.Get());
+            commandList->Dispatch(DivUp(3, 32), DivUp(4, 16), 1);
+
+            commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(nullptr));
+
+        }
+    }
+
+     // 
     // Bind and execute the operator on the GPU.
     // 
 
@@ -377,68 +599,7 @@ int __cdecl wmain(int /*argc*/, char ** /*argv*/)
         dmlBindingTable->BindPersistentResource(&bindingDesc);
     }
 
-    // Create tensor buffers for upload/input/output/readback of the tensor elements.
-
-    // 24 elements * 4 == 96 bytes.
-    UINT64 tensorBufferSize{ dmlBufferTensorDesc.TotalTensorSizeInBytes };
-
-    com_ptr<ID3D12Resource> uploadBuffer;
-    check_hresult(d3D12Device->CreateCommittedResource(
-        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
-        D3D12_HEAP_FLAG_NONE,
-        &CD3DX12_RESOURCE_DESC::Buffer(tensorBufferSize),
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        __uuidof(uploadBuffer),
-        uploadBuffer.put_void()));
-
-    com_ptr<ID3D12Resource> inputBuffer;
-    check_hresult(d3D12Device->CreateCommittedResource(
-        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
-        D3D12_HEAP_FLAG_NONE,
-        &CD3DX12_RESOURCE_DESC::Buffer(tensorBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-        D3D12_RESOURCE_STATE_COPY_DEST,
-        nullptr,
-        __uuidof(inputBuffer),
-        inputBuffer.put_void()));
-
-    std::wcout << std::fixed; std::wcout.precision(2);
-    std::array<FLOAT, tensorElementCount> inputTensorElementArray;
-    {
-        std::wcout << L"input tensor: ";
-        for (auto & element : inputTensorElementArray)
-        {
-            element = 1.618f;
-            std::wcout << element << L' ';
-        };
-        std::wcout << std::endl;
-
-        D3D12_SUBRESOURCE_DATA tensorSubresourceData{};
-        tensorSubresourceData.pData = inputTensorElementArray.data();
-        tensorSubresourceData.RowPitch = tensorBufferSize;
-        tensorSubresourceData.SlicePitch = tensorSubresourceData.RowPitch;
-
-        // Upload the input tensor to the GPU.
-        ::UpdateSubresources(
-            commandList.get(),
-            inputBuffer.get(),
-            uploadBuffer.get(),
-            0,
-            0,
-            1,
-            &tensorSubresourceData);
-
-        commandList->ResourceBarrier(
-            1,
-            &CD3DX12_RESOURCE_BARRIER::Transition(
-                inputBuffer.get(),
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                )
-            );
-    }
-
-    DML_BUFFER_BINDING inputBufferBinding{ inputBuffer.get(), 0, tensorBufferSize };
+    DML_BUFFER_BINDING inputBufferBinding{ float16_input.Get(), 0, tensorBufferSize };
     DML_BINDING_DESC inputBindingDesc{ DML_BINDING_TYPE_BUFFER, &inputBufferBinding };
     dmlBindingTable->BindInputs(1, &inputBindingDesc);
 
@@ -460,6 +621,80 @@ int __cdecl wmain(int /*argc*/, char ** /*argv*/)
     dmlCommandRecorder->RecordDispatch(commandList.get(), dmlCompiledOperator.get(), dmlBindingTable.get());
 
     CloseExecuteResetWait(d3D12Device, commandQueue, commandAllocator, commandList);
+
+     Microsoft::WRL::ComPtr<ID3D12Resource> float32_output;
+    {
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.Format = DXGI_FORMAT_R16_FLOAT;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.FirstElement = 0;
+        uavDesc.Buffer.NumElements = tensorElementCount;
+        uavDesc.Buffer.StructureByteStride = 0;
+        uavDesc.Buffer.CounterOffsetInBytes = 0;
+        uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+     d3D12Device->CreateUnorderedAccessView(outputBuffer.get(), nullptr, &uavDesc,
+            GetCpuHandle(d3D12Device.get(), descriptorHeap_float.get(), 0));
+
+        D3D12_RESOURCE_DESC resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(tensorElementCount*sizeof(float), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+     check_hresult(d3D12Device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &resourceDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&float32_output)
+        ));
+         uavDesc = {};
+        uavDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavDesc.Buffer.FirstElement = 0;
+        uavDesc.Buffer.NumElements = tensorElementCount;
+        uavDesc.Buffer.StructureByteStride = 0;
+        uavDesc.Buffer.CounterOffsetInBytes = 0;
+        uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+     d3D12Device->CreateUnorderedAccessView(float32_output.Get(), nullptr, &uavDesc,
+            GetCpuHandle(d3D12Device.get(), descriptorHeap_float.get(), 1));
+        auto computeShaderBlob = DX::ReadData(L"nchwtonhwc.cso");
+        // Create compute pipeline state
+        D3D12_COMPUTE_PIPELINE_STATE_DESC descComputePSO = {};
+        descComputePSO.pRootSignature = m_computeRootSignature.Get();
+        descComputePSO.CS.pShaderBytecode = computeShaderBlob.data();
+        descComputePSO.CS.BytecodeLength = computeShaderBlob.size();
+
+        check_hresult(
+            d3D12Device->CreateComputePipelineState(&descComputePSO, IID_PPV_ARGS(m_computePSO.ReleaseAndGetAddressOf())));
+        m_computePSO->SetName(L"Compute PSO");
+
+        ///================
+        // Convert image to tensor format (original texture -> model input)
+        {
+            ID3D12DescriptorHeap* pHeaps[] = { descriptorHeap_float.get() };
+            commandList->SetDescriptorHeaps(_countof(pHeaps), pHeaps);
+
+            commandList->SetComputeRootSignature(m_computeRootSignature.Get());
+            struct ImageLayoutCB
+            {
+                UINT Height;
+                UINT Width;
+                UINT Channel;
+            };
+            ImageLayoutCB imageLayoutCB = {};
+            imageLayoutCB.Height = 3;
+            imageLayoutCB.Width = 4;
+            imageLayoutCB.Channel = 2;
+
+            commandList->SetComputeRoot32BitConstants(0, 4, &imageLayoutCB, 0);
+            commandList->SetComputeRootDescriptorTable(1, GetGpuHandle(d3D12Device.get(), descriptorHeap_float.get(), 0));
+            commandList->SetComputeRootDescriptorTable(2, GetGpuHandle(d3D12Device.get(), descriptorHeap_float.get(), 1));
+
+            commandList->SetPipelineState(m_computePSO.Get());
+            commandList->Dispatch(DivUp(3, 32), DivUp(4, 16), 1);
+
+            commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(nullptr));
+
+        }
+    }
 
     // The output buffer now contains the result of the identity operator,
     // so read it back if you want the CPU to access it.
@@ -483,7 +718,7 @@ int __cdecl wmain(int /*argc*/, char ** /*argv*/)
             )
         );
 
-    commandList->CopyResource(readbackBuffer.get(), outputBuffer.get());
+    commandList->CopyResource(readbackBuffer.get(), float32_output.Get());
 
     CloseExecuteResetWait(d3D12Device, commandQueue, commandAllocator, commandList);
 
