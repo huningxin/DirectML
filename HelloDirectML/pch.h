@@ -8,7 +8,7 @@
 #include <winrt/Windows.Foundation.h>
 
 #include "d3dx12.h" // The D3D12 Helper Library that you downloaded.
-#include <DirectML.h> // The DirectML header from the Windows SDK.
+#include "DirectML.h" // The DirectML header from the Windows SDK.
 #include <dxgi1_4.h>
 
 #include <algorithm>
