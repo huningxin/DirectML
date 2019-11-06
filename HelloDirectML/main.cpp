@@ -11,6 +11,8 @@ using winrt::handle;
 
 #define USE_VPU 1
 
+bool g_support_f16 = 1;
+
 std::string DriverDescription(com_ptr<IDXCoreAdapter>& adapter, bool selected = false) {
 	// If the adapter is a software adapter then don't consider it for index selection
 	size_t driverDescriptionSize;
@@ -246,6 +248,14 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		__uuidof(dmlDevice),
 		dmlDevice.put_void()));
 
+	DML_FEATURE_DATA_TENSOR_DATA_TYPE_SUPPORT support_f16 = { false };
+	DML_FEATURE_QUERY_TENSOR_DATA_TYPE_SUPPORT fp16_query = {
+		DML_TENSOR_DATA_TYPE_FLOAT16 };
+	check_hresult(dmlDevice->CheckFeatureSupport(
+		DML_FEATURE_TENSOR_DATA_TYPE_SUPPORT, sizeof(fp16_query), &fp16_query,
+		sizeof(support_f16), &support_f16));
+	g_support_f16 = support_f16.IsSupported;
+	std::wcout << "Support float16 data type " << g_support_f16 << "\n";
 
 	// The command recorder is a stateless object that records Dispatches into an existing Direct3D 12 command list.
 	com_ptr<IDMLCommandRecorder> dmlCommandRecorder;
@@ -256,7 +266,8 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 	constexpr UINT inputSizes[4] = { 1, 512, 13, 13 };
 	constexpr UINT inputElementCount = inputSizes[0] * inputSizes[1] * inputSizes[2] * inputSizes[3];
 	DML_BUFFER_TENSOR_DESC inputTensorDesc = {};
-	inputTensorDesc.DataType = DML_TENSOR_DATA_TYPE_FLOAT32;
+	inputTensorDesc.DataType = g_support_f16 ? DML_TENSOR_DATA_TYPE_FLOAT16
+		: DML_TENSOR_DATA_TYPE_FLOAT32;
 	inputTensorDesc.Flags = DML_TENSOR_FLAG_NONE;
 	inputTensorDesc.DimensionCount = ARRAYSIZE(inputSizes);
 	inputTensorDesc.Sizes = inputSizes;
@@ -270,7 +281,8 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 	constexpr UINT weightSizes[4] = { 1000, 512, 1, 1 };
 	constexpr UINT weightElementCount = weightSizes[0] * weightSizes[1] * weightSizes[2] * weightSizes[3];
 	DML_BUFFER_TENSOR_DESC weightTensorDesc = {};
-	weightTensorDesc.DataType = DML_TENSOR_DATA_TYPE_FLOAT32;
+	weightTensorDesc.DataType = g_support_f16 ? DML_TENSOR_DATA_TYPE_FLOAT16
+		: DML_TENSOR_DATA_TYPE_FLOAT32;
 	weightTensorDesc.Flags = DML_TENSOR_FLAG_OWNED_BY_DML;
 	weightTensorDesc.DimensionCount = ARRAYSIZE(weightSizes);
 	weightTensorDesc.Sizes = weightSizes;
@@ -284,7 +296,8 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 	constexpr UINT outputSizes[4] = { 1, 1000, 13, 13 };
 	constexpr UINT outputElementCount = outputSizes[0] * outputSizes[1] * outputSizes[2] * outputSizes[3];
 	DML_BUFFER_TENSOR_DESC outputTensorDesc = {};
-	outputTensorDesc.DataType = DML_TENSOR_DATA_TYPE_FLOAT32;
+	outputTensorDesc.DataType = g_support_f16 ? DML_TENSOR_DATA_TYPE_FLOAT16
+		: DML_TENSOR_DATA_TYPE_FLOAT32;
 	outputTensorDesc.Flags = DML_TENSOR_FLAG_NONE;
 	outputTensorDesc.DimensionCount = ARRAYSIZE(outputSizes);
 	outputTensorDesc.Sizes = outputSizes;
@@ -345,7 +358,8 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 	com_ptr<IDMLCompiledOperator> dmlCompiledOperator;
 	check_hresult(dmlDevice->CompileOperator(
 		dmlOperator.get(),
-		DML_EXECUTION_FLAG_NONE,
+		g_support_f16 ? DML_EXECUTION_FLAG_ALLOW_HALF_PRECISION_COMPUTATION
+			: DML_EXECUTION_FLAG_NONE,
 		__uuidof(dmlCompiledOperator),
 		dmlCompiledOperator.put_void()));
 
@@ -433,7 +447,7 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		weightBuffer.put_void()));
 
 	// std::wcout << std::fixed; std::wcout.precision(2);
-	std::vector<FLOAT> weightElementArray(weightElementCount, 1);
+	std::vector<uint16_t> weightElementArray(weightElementCount, 1);
 	{
 		D3D12_SUBRESOURCE_DATA tensorSubresourceData{};
 		tensorSubresourceData.pData = weightElementArray.data();
@@ -575,7 +589,7 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		inputBuffer.put_void()));
 
 	// std::wcout << std::fixed; std::wcout.precision(2);
-	std::vector<FLOAT> inputTensorElementArray(inputElementCount, 1);
+	std::vector<uint16_t> inputTensorElementArray(inputElementCount, 1);
 	{
 		D3D12_SUBRESOURCE_DATA tensorSubresourceData{};
 		tensorSubresourceData.pData = inputTensorElementArray.data();
