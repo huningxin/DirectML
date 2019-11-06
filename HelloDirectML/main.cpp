@@ -9,60 +9,119 @@ using winrt::check_hresult;
 using winrt::check_bool;
 using winrt::handle;
 
-void InitializeDirect3D12(
-	com_ptr<ID3D12Device>& d3D12Device,
+#define USE_VPU 1
+
+std::string DriverDescription(com_ptr<IDXCoreAdapter>& adapter, bool selected = false) {
+	// If the adapter is a software adapter then don't consider it for index selection
+	size_t driverDescriptionSize;
+	check_hresult(adapter->GetPropertySize(DXCoreAdapterProperty::DriverDescription,
+		&driverDescriptionSize));
+	CHAR* driverDescription = new CHAR[driverDescriptionSize];
+	check_hresult(adapter->GetProperty(DXCoreAdapterProperty::DriverDescription,
+		driverDescriptionSize, driverDescription));
+	if (selected) {
+		printf("Using adapter : %s\n", driverDescription);
+	}
+
+	std::string driverDescriptionStr = std::string(driverDescription);
+	free(driverDescription);
+
+	return driverDescriptionStr;
+}
+
+void InitWithDXCore(com_ptr<ID3D12Device>& d3D12Device,
 	com_ptr<ID3D12CommandQueue>& commandQueue,
 	com_ptr<ID3D12CommandAllocator>& commandAllocator,
-	com_ptr<ID3D12GraphicsCommandList>& commandList)
-{
-#if defined(_DEBUG)
-	com_ptr<ID3D12Debug> d3D12Debug;
-	if (FAILED(D3D12GetDebugInterface(__uuidof(d3D12Debug), d3D12Debug.put_void())))
-	{
-		// The D3D12 debug layer is missing - you must install the Graphics Tools optional feature
-		winrt::throw_hresult(DXGI_ERROR_SDK_COMPONENT_MISSING);
+	com_ptr<ID3D12GraphicsCommandList>& commandList) {
+	HMODULE library = nullptr;
+	library = LoadLibrary(L"dxcore.dll");
+	if (!library) {
+		//throw hresult_invalid_argument(L"DXCore isn't support on this manchine.");
+		std::wcout << L"DXCore isn't support on this manchine. ";
+		return;
 	}
-	d3D12Debug->EnableDebugLayer();
-#endif
 
-	com_ptr<IDXGIFactory4> dxgiFactory;
-	check_hresult(CreateDXGIFactory1(__uuidof(dxgiFactory), dxgiFactory.put_void()));
+	com_ptr<IDXCoreAdapterFactory> adapterFactory;
+	check_hresult(DXCoreCreateAdapterFactory(IID_PPV_ARGS(adapterFactory.put())));
 
+	com_ptr<IDXCoreAdapterList> adapterList;
+	const GUID dxGUIDs[] = { DXCORE_ADAPTER_ATTRIBUTE_D3D12_CORE_COMPUTE };
+
+	check_hresult(
+		adapterFactory->CreateAdapterList(ARRAYSIZE(dxGUIDs), dxGUIDs, IID_PPV_ARGS(adapterList.put())));
+
+	com_ptr<IDXCoreAdapter> currAdapter = nullptr;
+	IUnknown* pAdapter = nullptr;
 	com_ptr<IDXGIAdapter> dxgiAdapter;
-	UINT adapterIndex{};
-	HRESULT hr{};
-	do
-	{
-		dxgiAdapter = nullptr;
-		check_hresult(dxgiFactory->EnumAdapters(adapterIndex, dxgiAdapter.put()));
-		++adapterIndex;
+	D3D_FEATURE_LEVEL d3dFeatureLevel = D3D_FEATURE_LEVEL_1_0_CORE;
+	D3D12_COMMAND_LIST_TYPE commandQueueType = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+	printf("Printing available adapters..\n");
+	for (UINT i = 0; i < adapterList->GetAdapterCount(); i++) {
+		currAdapter = nullptr;
+		check_hresult(adapterList->GetAdapter(i, currAdapter.put()));
 
-		hr = ::D3D12CreateDevice(
-			dxgiAdapter.get(),
-			D3D_FEATURE_LEVEL_12_0,
-			__uuidof(d3D12Device),
-			d3D12Device.put_void());
-		if (hr == DXGI_ERROR_UNSUPPORTED) continue;
-		check_hresult(hr);
-	} while (hr != S_OK);
+		bool isHardware;
+		check_hresult(currAdapter->GetProperty(DXCoreAdapterProperty::IsHardware, &isHardware));
+#if USE_VPU == 1
+		std::string adapterNameStr = "VPU";
+		std::string driverDescriptionStr = DriverDescription(currAdapter);
+		std::transform(driverDescriptionStr.begin(), driverDescriptionStr.end(),
+			driverDescriptionStr.begin(), ::tolower);
+		std::transform(adapterNameStr.begin(), adapterNameStr.end(), adapterNameStr.begin(),
+			::tolower);
+		if (isHardware && strstr(driverDescriptionStr.c_str(), adapterNameStr.c_str())) {
+			pAdapter = currAdapter.get();
+			break;
+		}
+#else
+	// Check if adapter selected has DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS attribute selected. If
+	// so, then GPU was selected that has D3D12 and D3D11 capabilities. It would be the most stable
+	// to use DXGI to enumerate GPU and use D3D_FEATURE_LEVEL_11_0 so that image tensorization for
+	// video frames would be able to happen on the GPU.
+	if (isHardware && currAdapter->IsAttributeSupported(DXCORE_ADAPTER_ATTRIBUTE_D3D12_GRAPHICS)) {
+		d3dFeatureLevel = D3D_FEATURE_LEVEL::D3D_FEATURE_LEVEL_11_0;
+		com_ptr<IDXGIFactory4> dxgiFactory4;
+		HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(dxgiFactory4.put()));
+		if (hr == S_OK) {
+			// If DXGI factory creation was successful then get the IDXGIAdapter from the LUID
+			// acquired from the selectedAdapter
+			std::cout << "Using DXGI for adapter creation.." << std::endl;
+			LUID adapterLuid;
+			check_hresult(currAdapter->GetProperty(DXCoreAdapterProperty::InstanceLuid, &adapterLuid));
+			check_hresult(dxgiFactory4->EnumAdapterByLuid(adapterLuid, __uuidof(IDXGIAdapter),
+				dxgiAdapter.put_void()));
+			pAdapter = dxgiAdapter.get();
+			break;
+		}
+	}
+#endif
+	}
 
-	D3D12_COMMAND_QUEUE_DESC commandQueueDesc{};
-	commandQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-	commandQueueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+	if (currAdapter == nullptr) {
+		std::wcout << L"ERROR: No matching adapter with given adapter name: ";
+		return;
+	}
+	DriverDescription(currAdapter, true);
 
-	check_hresult(d3D12Device->CreateCommandQueue(
-		&commandQueueDesc,
-		__uuidof(commandQueue),
+	// create D3D12Device
+	check_hresult(
+		D3D12CreateDevice(pAdapter, d3dFeatureLevel, __uuidof(ID3D12Device), d3D12Device.put_void()));
+
+	// create D3D12 command queue from device
+	//com_ptr<ID3D12CommandQueue> d3d12CommandQueue;
+	D3D12_COMMAND_QUEUE_DESC commandQueueDesc = {};
+	commandQueueDesc.Type = commandQueueType;
+	check_hresult(d3D12Device->CreateCommandQueue(&commandQueueDesc, __uuidof(ID3D12CommandQueue),
 		commandQueue.put_void()));
 
 	check_hresult(d3D12Device->CreateCommandAllocator(
-		D3D12_COMMAND_LIST_TYPE_DIRECT,
+		commandQueueType,
 		__uuidof(commandAllocator),
 		commandAllocator.put_void()));
 
 	check_hresult(d3D12Device->CreateCommandList(
 		0,
-		D3D12_COMMAND_LIST_TYPE_DIRECT,
+		commandQueueType,
 		commandAllocator.get(),
 		nullptr,
 		__uuidof(commandList),
@@ -169,7 +228,7 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 	com_ptr<ID3D12GraphicsCommandList> commandList;
 
 	// Set up Direct3D 12.
-	InitializeDirect3D12(d3D12Device, commandQueue, commandAllocator, commandList);
+	InitWithDXCore(d3D12Device, commandQueue, commandAllocator, commandList);
 
 	// Create the DirectML device.
 
@@ -177,7 +236,7 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 
 #if defined (_DEBUG)
 	// If the project is in a debug build, then enable debugging via DirectML debug layers with this flag.
-	dmlCreateDeviceFlags |= DML_CREATE_DEVICE_FLAG_DEBUG;
+	//dmlCreateDeviceFlags |= DML_CREATE_DEVICE_FLAG_DEBUG;
 #endif
 
 	com_ptr<IDMLDevice> dmlDevice;
@@ -194,7 +253,7 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		__uuidof(dmlCommandRecorder),
 		dmlCommandRecorder.put_void()));
 
-	constexpr UINT inputSizes[4] = { 1, 3, 8, 8 };
+	constexpr UINT inputSizes[4] = { 1, 512, 13, 13 };
 	constexpr UINT inputElementCount = inputSizes[0] * inputSizes[1] * inputSizes[2] * inputSizes[3];
 	DML_BUFFER_TENSOR_DESC inputTensorDesc = {};
 	inputTensorDesc.DataType = DML_TENSOR_DATA_TYPE_FLOAT32;
@@ -208,7 +267,7 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		inputTensorDesc.Sizes,
 		inputTensorDesc.Strides);
 
-	constexpr UINT weightSizes[4] = { 1, 3, 3, 2 };
+	constexpr UINT weightSizes[4] = { 1000, 512, 1, 1 };
 	constexpr UINT weightElementCount = weightSizes[0] * weightSizes[1] * weightSizes[2] * weightSizes[3];
 	DML_BUFFER_TENSOR_DESC weightTensorDesc = {};
 	weightTensorDesc.DataType = DML_TENSOR_DATA_TYPE_FLOAT32;
@@ -222,9 +281,8 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		weightTensorDesc.Sizes,
 		weightTensorDesc.Strides);
 
-	constexpr UINT outputSizes[4] = { 1, 1, 8, 8 };
+	constexpr UINT outputSizes[4] = { 1, 1000, 13, 13 };
 	constexpr UINT outputElementCount = outputSizes[0] * outputSizes[1] * outputSizes[2] * outputSizes[3];
-
 	DML_BUFFER_TENSOR_DESC outputTensorDesc = {};
 	outputTensorDesc.DataType = DML_TENSOR_DATA_TYPE_FLOAT32;
 	outputTensorDesc.Flags = DML_TENSOR_FLAG_NONE;
@@ -252,8 +310,8 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 
 		const uint32_t strides[2] = { 1, 1 };
 		const uint32_t dilations[2] = { 1, 1 };
-		const uint32_t start_padding[2] = { 1, 0 };
-		const uint32_t end_padding[2] = { 1, 1 };
+		const uint32_t start_padding[2] = { 0, 0 };
+		const uint32_t end_padding[2] = { 0, 0 };
 		const uint32_t output_padding[2] = { 0, 0 };
 
 		DML_CONVOLUTION_OPERATOR_DESC conv_operator_desc = {
@@ -375,16 +433,8 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		weightBuffer.put_void()));
 
 	// std::wcout << std::fixed; std::wcout.precision(2);
-	std::array<FLOAT, weightElementCount> weightElementArray;
+	std::vector<FLOAT> weightElementArray(weightElementCount, 1);
 	{
-		std::wcout << L"input tensor: ";
-		for (auto& element : weightElementArray)
-		{
-			element = 1.0f;
-			// std::wcout << element << L' ';
-		};
-		std::wcout << std::endl;
-
 		D3D12_SUBRESOURCE_DATA tensorSubresourceData{};
 		tensorSubresourceData.pData = weightElementArray.data();
 		tensorSubresourceData.RowPitch = weightBufferSize;
@@ -525,16 +575,8 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		inputBuffer.put_void()));
 
 	// std::wcout << std::fixed; std::wcout.precision(2);
-	std::array<FLOAT, inputElementCount> inputTensorElementArray;
+	std::vector<FLOAT> inputTensorElementArray(inputElementCount, 1);
 	{
-		std::wcout << L"input tensor: ";
-		for (auto& element : inputTensorElementArray)
-		{
-			element = 1.0f;
-			// std::wcout << element << L' ';
-		};
-		std::wcout << std::endl;
-
 		D3D12_SUBRESOURCE_DATA tensorSubresourceData{};
 		tensorSubresourceData.pData = inputTensorElementArray.data();
 		tensorSubresourceData.RowPitch = inputBufferSize;
@@ -560,7 +602,7 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 		);
 	}
 
-	
+
 
 	DML_BUFFER_BINDING inputBufferBinding[3];
 	inputBufferBinding[0] = { inputBuffer.get(), 0, inputBufferSize };
@@ -596,7 +638,7 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 
 	SYSTEMTIME sys_2;
 	GetLocalTime(&sys_2);
-	std::wcout << L"predict time: " << sys_2.wMilliseconds - sys_1.wMilliseconds << "\n";
+	std::wcout << L"predict time: " << sys_2.wMilliseconds - sys_1.wMilliseconds << " ms\n";
 
 	// The output buffer now contains the result of the identity operator,
 	// so read it back if you want the CPU to access it.
@@ -628,15 +670,6 @@ int __cdecl wmain(int /*argc*/, char** /*argv*/)
 	FLOAT* outputBufferData{};
 	check_hresult(readbackBuffer->Map(0, &tensorBufferRange, reinterpret_cast<void**>(&outputBufferData)));
 
-	std::wcout << L"output tensor: ";
-	for (size_t tensorElementIndex{ 0 }; tensorElementIndex < outputElementCount; ++tensorElementIndex, ++outputBufferData)
-	{
-	    std::wcout << *outputBufferData << L' ';
-	}
-	std::wcout << std::endl;
-
 	D3D12_RANGE emptyRange{ 0, 0 };
 	readbackBuffer->Unmap(0, &emptyRange);
-	GetLocalTime(&sys_2);
-	std::wcout << L"predict time: " << sys_2.wMilliseconds - sys_1.wMilliseconds << "\n";
 }
